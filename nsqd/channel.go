@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -133,9 +135,56 @@ func NewChannel(topicName string, channelName string, nsqd *NSQD,
 		)
 	}
 
+	if !c.ephemeral {
+		c.loadDeferredMessages()
+	}
+
 	c.nsqd.Notify(c, !c.ephemeral)
 
 	return c
+}
+
+// deferredFileName returns the path of the file used to persist this
+// channel's deferred messages across restarts
+func (c *Channel) deferredFileName() string {
+	backendName := getBackendName(c.topicName, c.name)
+	return filepath.Join(c.nsqd.getOpts().DataPath, backendName+".deferred.dat")
+}
+
+// loadDeferredMessages restores deferred messages persisted by a previous
+// clean shutdown. The persisted absolute expiration timestamp is
+// authoritative: messages that expired while nsqd was down are made
+// available immediately, all others are re-deferred until their original
+// expiration time (the delay is never restarted from zero).
+func (c *Channel) loadDeferredMessages() {
+	fn := c.deferredFileName()
+	maxMsgSize := int32(c.nsqd.getOpts().MaxMsgSize) + minValidMsgLength
+	records, err := readDeferredFile(fn, maxMsgSize)
+	if err != nil {
+		c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to read deferred messages file - %s", c.name, err)
+	}
+	if len(records) == 0 {
+		return
+	}
+	// remove the file before restoring so that a crash cannot result in
+	// the same messages being restored twice
+	if err := os.Remove(fn); err != nil {
+		c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to remove deferred messages file - %s", c.name, err)
+	}
+	c.nsqd.logf(LOG_INFO, "CHANNEL(%s): restoring %d deferred messages", c.name, len(records))
+	now := time.Now().UnixNano()
+	for _, r := range records {
+		if r.expiresAt <= now {
+			// expired while nsqd was down, make it available immediately
+			if err := c.put(r.msg); err != nil {
+				c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to requeue expired deferred message - %s", c.name, err)
+			}
+			continue
+		}
+		if err := c.deferMessageUntil(r.msg, r.expiresAt); err != nil {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to restore deferred message - %s", c.name, err)
+		}
+	}
 }
 
 func (c *Channel) initPQ() {
@@ -199,6 +248,10 @@ func (c *Channel) exit(deleted bool) error {
 		err := c.Empty()
 		if err != nil {
 			return err
+		}
+		if !c.ephemeral {
+			// remove any persisted deferred state, too
+			os.Remove(c.deferredFileName())
 		}
 		return c.backend.Delete()
 	}
@@ -275,11 +328,34 @@ finish:
 	c.inFlightMutex.Unlock()
 
 	c.deferredMutex.Lock()
-	for _, item := range c.deferredMessages {
-		msg := item.Value.(*Message)
-		err := writeMessageToBackend(msg, c.backend)
-		if err != nil {
-			c.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+	if len(c.deferredMessages) > 0 {
+		if c.ephemeral {
+			for _, item := range c.deferredMessages {
+				msg := item.Value.(*Message)
+				err := writeMessageToBackend(msg, c.backend)
+				if err != nil {
+					c.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+				}
+			}
+		} else {
+			// persist deferred messages with their absolute expiration
+			// timestamp so the remaining delay survives a restart
+			items := make([]*pqueue.Item, 0, len(c.deferredMessages))
+			for _, item := range c.deferredMessages {
+				items = append(items, item)
+			}
+			err := writeDeferredFile(c.deferredFileName(), items)
+			if err != nil {
+				c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to persist deferred messages - %s", c.name, err)
+				// fall back to the backend so messages are not lost
+				// (they lose their remaining delay)
+				for _, item := range items {
+					msg := item.Value.(*Message)
+					if werr := writeMessageToBackend(msg, c.backend); werr != nil {
+						c.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", werr)
+					}
+				}
+			}
 		}
 	}
 	c.deferredMutex.Unlock()
@@ -530,7 +606,13 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
 }
 
 func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
-	absTs := time.Now().Add(timeout).UnixNano()
+	return c.deferMessageUntil(msg, time.Now().Add(timeout).UnixNano())
+}
+
+// deferMessageUntil defers delivery of msg until the absolute time absTs
+// (UnixNano). The absolute timestamp is the authoritative value that gets
+// persisted across restarts; it is never recomputed from scratch.
+func (c *Channel) deferMessageUntil(msg *Message, absTs int64) error {
 	item := &pqueue.Item{Value: msg, Priority: absTs}
 	err := c.pushDeferredMessage(item)
 	if err != nil {

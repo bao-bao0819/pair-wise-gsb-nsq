@@ -258,3 +258,89 @@ func TestChannelHealth(t *testing.T) {
 	test.Nil(t, err)
 	test.Equal(t, "OK", string(body))
 }
+
+// ensure that deferred messages (DPUB / deferred REQ) survive a clean
+// restart with their original absolute expiration time, and that messages
+// already transitioned to the live queue are neither lost nor duplicated
+func TestDeferredMessagesSurviveRestart(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MemQueueSize = 100
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	origDataPath := opts.DataPath
+
+	topicName := "test_deferred_restart" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("ch")
+
+	// message 1: expires while nsqd is down
+	msgExpired := NewMessage(topic.GenerateID(), []byte("expired-during-downtime"))
+	channel.PutMessageDeferred(msgExpired, 50*time.Millisecond)
+
+	// message 2: expires after the restart
+	msgFuture := NewMessage(topic.GenerateID(), []byte("expires-after-restart"))
+	expectedExpiry := time.Now().Add(time.Hour).UnixNano()
+	channel.PutMessageDeferred(msgFuture, time.Hour)
+
+	// message 3: already moved from the deferred queue to the live queue
+	msgLive := NewMessage(topic.GenerateID(), []byte("already-live"))
+	err := channel.PutMessage(msgLive)
+	test.Nil(t, err)
+
+	nsqd.Exit()
+
+	// ensure message 1 expires during the "downtime"
+	time.Sleep(100 * time.Millisecond)
+
+	opts = NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MemQueueSize = 100
+	opts.DataPath = origDataPath
+	_, _, nsqd = mustStartNSQD(opts)
+	defer nsqd.Exit()
+
+	topic = nsqd.GetTopic(topicName)
+	channel = topic.GetChannel("ch")
+
+	// message 1 expired during downtime: it must be available immediately
+	select {
+	case msg := <-channel.memoryMsgChan:
+		test.Equal(t, msgExpired.ID, msg.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for deferred message that expired during downtime")
+	}
+
+	// message 3 was already live: it must have survived exactly once
+	// (flushed to the backend at shutdown)
+	select {
+	case b := <-channel.backend.ReadChan():
+		msg, err := decodeMessage(b)
+		test.Nil(t, err)
+		test.Equal(t, msgLive.ID, msg.ID)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for message that was live at shutdown")
+	}
+
+	// message 2 must still be deferred with its ORIGINAL absolute
+	// expiration time, not restarted from zero
+	channel.deferredMutex.Lock()
+	item, ok := channel.deferredMessages[msgFuture.ID]
+	channel.deferredMutex.Unlock()
+	test.Equal(t, true, ok)
+	if item != nil {
+		if item.Priority < expectedExpiry-int64(10*time.Second) ||
+			item.Priority > expectedExpiry+int64(10*time.Second) {
+			t.Fatalf("deferred expiry was recomputed: got %d, want ~%d",
+				item.Priority, expectedExpiry)
+		}
+	}
+
+	// nothing was lost or duplicated: nothing left but the deferred message
+	test.Equal(t, 0, len(channel.memoryMsgChan))
+	test.Equal(t, int64(0), channel.backend.Depth())
+	channel.deferredMutex.Lock()
+	numDeferred := len(channel.deferredMessages)
+	channel.deferredMutex.Unlock()
+	test.Equal(t, 1, numDeferred)
+}
