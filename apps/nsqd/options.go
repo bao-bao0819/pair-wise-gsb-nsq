@@ -172,6 +172,9 @@ func nsqdFlagSet(opts *nsqd.Options) *flag.FlagSet {
 	flagSet.Duration("output-buffer-timeout", opts.OutputBufferTimeout, "default duration of time between flushing data to clients")
 	flagSet.Int("max-channel-consumers", opts.MaxChannelConsumers, "maximum channel consumer connection count per nsqd instance (default 0, i.e., unlimited)")
 
+	// ephemeral channel options
+	flagSet.Duration("ephemeral-channel-grace-period", opts.EphemeralChannelGracePeriod, "duration to keep an idle ephemeral channel after its last consumer disconnects, allowing re-subscription to cancel deletion (default 0, i.e., delete immediately)")
+
 	// statsd integration options
 	flagSet.String("statsd-address", opts.StatsdAddress, "UDP <addr>:<port> of a statsd daemon for pushing stats")
 	flagSet.Duration("statsd-interval", opts.StatsdInterval, "duration between pushing to statsd")

@@ -71,6 +71,11 @@ max_output_buffer_size = 65536
 ## maximum client configurable duration of time between flushing to a client (time.Duration)
 max_output_buffer_timeout = "1s"
 
+## duration to keep an idle ephemeral channel after its last consumer
+## disconnects, allowing re-subscription to cancel deletion
+## (default 0, i.e., delete immediately) (time.Duration)
+# ephemeral_channel_grace_period = "0s"
+
 
 ## UDP <addr>:<port> of a statsd daemon for pushing stats
 # statsd_address = "127.0.0.1:8125"

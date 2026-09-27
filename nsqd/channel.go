@@ -65,6 +65,13 @@ type Channel struct {
 	deleteCallback func(*Channel)
 	deleter        sync.Once
 
+	// ephemeralTimer, when non-nil, is a pending grace-period deletion of an
+	// idle ephemeral channel; guarded by the embedded RWMutex (like clients)
+	ephemeralTimer *time.Timer
+	// ephemeralDeleteHook, when set, is invoked by the grace-period timer
+	// callback before it evaluates deletion (used by tests to synchronize)
+	ephemeralDeleteHook func()
+
 	// Stats tracking
 	e2eProcessingLatencyStream *quantile.Quantile
 
@@ -174,6 +181,15 @@ func (c *Channel) exit(deleted bool) error {
 	if !atomic.CompareAndSwapInt32(&c.exitFlag, 0, 1) {
 		return errors.New("exiting")
 	}
+
+	// cancel any pending grace-period deletion; explicit deletion,
+	// topic exit, and close always take precedence
+	c.Lock()
+	if c.ephemeralTimer != nil {
+		c.ephemeralTimer.Stop()
+		c.ephemeralTimer = nil
+	}
+	c.Unlock()
 
 	if deleted {
 		c.nsqd.logf(LOG_INFO, "CHANNEL(%s): deleting", c.name)
@@ -486,6 +502,12 @@ func (c *Channel) AddClient(clientID int64, client Consumer) error {
 
 	c.Lock()
 	c.clients[clientID] = client
+	if c.ephemeralTimer != nil {
+		// a consumer (re)subscribed during the grace period,
+		// cancel the pending deletion
+		c.ephemeralTimer.Stop()
+		c.ephemeralTimer = nil
+	}
 	c.Unlock()
 	return nil
 }
@@ -509,11 +531,45 @@ func (c *Channel) RemoveClient(clientID int64) {
 	c.Lock()
 	delete(c.clients, clientID)
 	numClients := len(c.clients)
+	var gracePeriod time.Duration
+	if numClients == 0 && c.ephemeral {
+		gracePeriod = c.nsqd.getOpts().EphemeralChannelGracePeriod
+		if gracePeriod > 0 {
+			// keep the idle ephemeral channel around for a grace period
+			// so that a briefly disconnected consumer can resubscribe;
+			// backlog stays bounded by the configured mem-queue-size
+			var timer *time.Timer
+			timer = time.AfterFunc(gracePeriod, func() {
+				c.deleteIdleEphemeral(timer)
+			})
+			c.ephemeralTimer = timer
+		}
+	}
 	c.Unlock()
 
-	if numClients == 0 && c.ephemeral {
+	if numClients == 0 && c.ephemeral && gracePeriod <= 0 {
 		go c.deleter.Do(func() { c.deleteCallback(c) })
 	}
+}
+
+// deleteIdleEphemeral is invoked when the grace period of an idle ephemeral
+// channel expires. It deletes the channel only if its timer is still the
+// pending one (i.e. it was not cancelled by a resubscribe, an explicit
+// delete, or superseded by a newer timer) and no consumer reattached.
+func (c *Channel) deleteIdleEphemeral(timer *time.Timer) {
+	if c.ephemeralDeleteHook != nil {
+		c.ephemeralDeleteHook()
+	}
+
+	c.Lock()
+	if c.ephemeralTimer != timer || len(c.clients) > 0 {
+		c.Unlock()
+		return
+	}
+	c.ephemeralTimer = nil
+	c.Unlock()
+
+	c.deleter.Do(func() { c.deleteCallback(c) })
 }
 
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {

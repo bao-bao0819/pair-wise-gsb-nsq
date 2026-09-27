@@ -64,6 +64,9 @@ type Options struct {
 	OutputBufferTimeout    time.Duration `flag:"output-buffer-timeout"`
 	MaxChannelConsumers    int           `flag:"max-channel-consumers"`
 
+	// ephemeral channel options
+	EphemeralChannelGracePeriod time.Duration `flag:"ephemeral-channel-grace-period" cfg:"ephemeral_channel_grace_period"`
+
 	// statsd integration
 	StatsdAddress          string        `flag:"statsd-address"`
 	StatsdPrefix           string        `flag:"statsd-prefix"`
@@ -169,6 +172,8 @@ func NewOptions() *Options {
 		MinOutputBufferTimeout: 25 * time.Millisecond,
 		OutputBufferTimeout:    250 * time.Millisecond,
 		MaxChannelConsumers:    0,
+
+		EphemeralChannelGracePeriod: 0,
 
 		StatsdPrefix:        "nsq.%s",
 		StatsdInterval:      60 * time.Second,

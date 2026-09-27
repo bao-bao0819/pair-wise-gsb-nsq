@@ -258,3 +258,189 @@ func TestChannelHealth(t *testing.T) {
 	test.Nil(t, err)
 	test.Equal(t, "OK", string(body))
 }
+
+func waitForEphemeralChannelDeletion(t *testing.T, topic *Topic, channelName string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		_, err := topic.GetExistingChannel(channelName)
+		if err != nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("channel(%s) was not deleted", channelName)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// a consumer that resubscribes while the grace-period deletion is about to
+// trigger must cancel the deletion; the channel (and its client) survive
+func TestEphemeralChannelGracePeriodResubscribe(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MemQueueSize = 100
+	opts.EphemeralChannelGracePeriod = 10 * time.Millisecond
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "ephemeral_grace_resub" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("ch1#ephemeral")
+
+	// synchronization point: parks the grace-period timer callback at the
+	// exact moment it is about to evaluate deletion
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
+	channel.ephemeralDeleteHook = func() {
+		close(hookEntered)
+		<-hookRelease
+	}
+
+	client := newClientV2(0, nil, nsqd)
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+	channel.RemoveClient(client.ID)
+
+	// wait until the grace period expired and deletion is about to trigger
+	select {
+	case <-hookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("grace period timer did not fire")
+	}
+
+	// resubscribe exactly as deletion is about to trigger
+	client2 := newClientV2(1, nil, nsqd)
+	err = channel.AddClient(client2.ID, client2)
+	test.Nil(t, err)
+	close(hookRelease)
+
+	// the resubscribe must have cancelled the pending deletion
+	test.Equal(t, false, channel.Exiting())
+	channel.RLock()
+	timerCancelled := channel.ephemeralTimer == nil
+	channel.RUnlock()
+	test.Equal(t, true, timerCancelled)
+	existingChannel, err := topic.GetExistingChannel("ch1#ephemeral")
+	test.Nil(t, err)
+	test.Equal(t, channel, existingChannel)
+
+	// a subsequent idle period must still schedule (and execute) deletion,
+	// i.e. the cancelled timer did not consume the one-shot deleter
+	channel.ephemeralDeleteHook = nil
+	channel.RemoveClient(client2.ID)
+	waitForEphemeralChannelDeletion(t, topic, "ch1#ephemeral")
+}
+
+// an idle ephemeral channel is deleted once the grace period expires and,
+// while waiting, its backlog stays bounded by the configured mem-queue-size
+// (the grace period must not turn it into an unbounded queue)
+func TestEphemeralChannelGracePeriodExpiry(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MemQueueSize = 2
+	opts.EphemeralChannelGracePeriod = 10 * time.Millisecond
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "ephemeral_grace_expiry" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("ch1#ephemeral")
+
+	// park the deletion so the backlog can be observed deterministically
+	// while the channel is inside its grace period
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
+	channel.ephemeralDeleteHook = func() {
+		close(hookEntered)
+		<-hookRelease
+	}
+
+	client := newClientV2(0, nil, nsqd)
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+	channel.RemoveClient(client.ID)
+
+	select {
+	case <-hookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("grace period timer did not fire")
+	}
+
+	// publish more messages than mem-queue-size while the channel is idle
+	// in its grace period
+	for i := 0; i < 10; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("grace_period_message"))
+		err := topic.PutMessage(msg)
+		test.Nil(t, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for channel.Depth() < opts.MemQueueSize {
+		if time.Now().After(deadline) {
+			t.Fatal("messages were not routed to the idle channel")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	test.Equal(t, opts.MemQueueSize, channel.Depth())
+
+	// no consumer reattached, so the deletion must proceed
+	close(hookRelease)
+	waitForEphemeralChannelDeletion(t, topic, "ch1#ephemeral")
+}
+
+// explicit deletion and re-creation of a same-named channel take priority
+// over a pending grace-period recycle: the old timer must not delete the
+// new channel instance
+func TestEphemeralChannelGracePeriodStaleTimer(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MemQueueSize = 100
+	opts.EphemeralChannelGracePeriod = 10 * time.Millisecond
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "ephemeral_grace_stale" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("ch1#ephemeral")
+
+	hookEntered := make(chan struct{})
+	hookRelease := make(chan struct{})
+	channel.ephemeralDeleteHook = func() {
+		close(hookEntered)
+		<-hookRelease
+	}
+
+	client := newClientV2(0, nil, nsqd)
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+	channel.RemoveClient(client.ID)
+
+	// the old channel's grace-period timer fired and is parked at the
+	// deletion decision point
+	select {
+	case <-hookEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("grace period timer did not fire")
+	}
+
+	// explicit deletion wins over the pending recycle task
+	err = topic.DeleteExistingChannel("ch1#ephemeral")
+	test.Nil(t, err)
+
+	// a new channel reuses the same name
+	newChannel := topic.GetChannel("ch1#ephemeral")
+	if newChannel == channel {
+		t.Fatal("expected a new channel instance")
+	}
+
+	// release the old timer; it must not delete the new instance
+	close(hookRelease)
+
+	test.Equal(t, false, newChannel.Exiting())
+	existingChannel, err := topic.GetExistingChannel("ch1#ephemeral")
+	test.Nil(t, err)
+	test.Equal(t, newChannel, existingChannel)
+}

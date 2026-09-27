@@ -119,7 +119,11 @@ func (t *Topic) getOrCreateChannel(channelName string) (*Channel, bool) {
 	channel, ok := t.channelMap[channelName]
 	if !ok {
 		deleteCallback := func(c *Channel) {
-			_ = t.DeleteExistingChannel(c.name)
+			// only delete if this exact instance is still registered,
+			// so a stale async delete (e.g. an expired ephemeral
+			// grace-period timer) cannot remove a newer channel
+			// that reused the same name
+			_ = t.deleteExistingChannel(c.name, c)
 		}
 		channel = NewChannel(t.name, channelName, t.nsqd, deleteCallback)
 		t.channelMap[channelName] = channel
@@ -141,11 +145,21 @@ func (t *Topic) GetExistingChannel(channelName string) (*Channel, error) {
 
 // DeleteExistingChannel removes a channel from the topic only if it exists
 func (t *Topic) DeleteExistingChannel(channelName string) error {
+	return t.deleteExistingChannel(channelName, nil)
+}
+
+// deleteExistingChannel removes a channel from the topic only if it exists;
+// when expected is non-nil, removal only proceeds if the registered channel
+// is still that exact instance
+func (t *Topic) deleteExistingChannel(channelName string, expected *Channel) error {
 	t.RLock()
 	channel, ok := t.channelMap[channelName]
 	t.RUnlock()
 	if !ok {
 		return errors.New("channel does not exist")
+	}
+	if expected != nil && channel != expected {
+		return errors.New("channel instance changed")
 	}
 
 	t.nsqd.logf(LOG_INFO, "TOPIC(%s): deleting channel %s", t.name, channel.name)
