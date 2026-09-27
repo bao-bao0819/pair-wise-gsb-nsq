@@ -89,6 +89,49 @@ func decodeMessage(b []byte) (*Message, error) {
 	return &msg, nil
 }
 
+// deferredMsgHeaderLength is the size of the prefix added to a deferred
+// message when it is persisted: an 8-byte big-endian absolute expiry
+// timestamp (UnixNano) at which the message should become deliverable.
+const deferredMsgHeaderLength = 8
+
+// writeDeferredMessage serializes a deferred message as its absolute expiry
+// timestamp followed by the standard message serialization.
+//
+// Storing the absolute expiry (rather than a relative duration) ensures the
+// original schedule survives a restart verbatim and is never recomputed
+// from the restart time.
+func writeDeferredMessage(w io.Writer, msg *Message, deferredTs int64) (int64, error) {
+	var buf [deferredMsgHeaderLength]byte
+	binary.BigEndian.PutUint64(buf[:], uint64(deferredTs))
+
+	n, err := w.Write(buf[:])
+	total := int64(n)
+	if err != nil {
+		return total, err
+	}
+
+	m, err := msg.WriteTo(w)
+	total += m
+	return total, err
+}
+
+// decodeDeferredMessage deserializes data (as []byte) produced by
+// writeDeferredMessage, returning the message and its absolute expiry
+// timestamp (UnixNano).
+func decodeDeferredMessage(b []byte) (*Message, int64, error) {
+	if len(b) < deferredMsgHeaderLength+minValidMsgLength {
+		return nil, 0, fmt.Errorf("invalid deferred message buffer size (%d)", len(b))
+	}
+
+	deferredTs := int64(binary.BigEndian.Uint64(b[:deferredMsgHeaderLength]))
+	msg, err := decodeMessage(b[deferredMsgHeaderLength:])
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return msg, deferredTs, nil
+}
+
 func writeMessageToBackend(msg *Message, bq BackendQueue) error {
 	buf := bufferPoolGet()
 	defer bufferPoolPut(buf)

@@ -2,9 +2,13 @@ package nsqd
 
 import (
 	"container/heap"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"math"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -131,11 +135,180 @@ func NewChannel(topicName string, channelName string, nsqd *NSQD,
 			nsqd.getOpts().SyncTimeout,
 			dqLogf,
 		)
+		// restore any deferred messages (DPUB / deferred REQ) persisted by a
+		// previous run before this channel starts accepting new messages
+		c.loadDeferredMessages()
 	}
 
 	c.nsqd.Notify(c, !c.ephemeral)
 
 	return c
+}
+
+// deferredFileName returns the path of the file used to persist this
+// channel's deferred messages across restarts.
+func (c *Channel) deferredFileName() string {
+	backendName := getBackendName(c.topicName, c.name)
+	return filepath.Join(c.nsqd.getOpts().DataPath, backendName+".deferred.dat")
+}
+
+// Deferred message persistence
+//
+// Deferred messages (from DPUB with a defer timeout, or deferred REQ) are
+// tracked in memory in deferredPQ, ordered by absolute expiry timestamp
+// (UnixNano). On a clean shutdown the queue is snapshotted to
+// <topic>:<channel>.deferred.dat (atomically, via a tmp file + rename) and
+// restored verbatim on the next startup, so the original schedule is never
+// recomputed from the restart time and the in-memory priority queue is not
+// the only source of truth. As with the in-memory message queue, an
+// unclean shutdown (crash/kill) can lose deferred messages that were never
+// flushed.
+//
+// Clock change rules (expiry is always stored and compared as an absolute
+// wall-clock timestamp against time.Now()):
+//
+//   - clock moves backwards: affected messages simply expire later in
+//     wall-clock terms, when the clock next reaches the stored expiry.
+//     Nothing is dropped or re-armed.
+//   - clock moves forwards: every message whose stored expiry is now in the
+//     past is promoted to the deliverable queue on the next queue scan
+//     (within QueueScanInterval). Messages are delivered late, never lost
+//     and never duplicated.
+//   - restart: the persisted absolute expiry is restored as-is; downtime
+//     counts towards the delay, so messages that expired while nsqd was
+//     down are promoted immediately after startup.
+//
+// The on-disk layout is a sequence of length-prefixed records:
+//
+//	[4-byte big-endian record length]
+//	[8-byte big-endian absolute expiry (UnixNano)]
+//	[standard message serialization, see Message.WriteTo]
+//
+// The main queue format is unchanged, so existing disk data remains fully
+// compatible; a missing deferred file simply means no deferred state.
+
+// loadDeferredMessages restores deferred messages persisted by a previous
+// run. It is called synchronously from NewChannel so that a fast
+// stop/start cycle cannot lose or duplicate deferred state.
+func (c *Channel) loadDeferredMessages() {
+	fn := c.deferredFileName()
+	f, err := os.Open(fn)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to open deferred file %s - %s", c.name, fn, err)
+		}
+		return
+	}
+
+	corrupt := false
+	restored := 0
+	maxRecordSize := int64(deferredMsgHeaderLength) + int64(minValidMsgLength) + c.nsqd.getOpts().MaxMsgSize
+	for {
+		var lenBuf [4]byte
+		_, err := io.ReadFull(f, lenBuf[:])
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): corrupt deferred file %s - %s", c.name, fn, err)
+			corrupt = true
+			break
+		}
+		recordLen := int64(binary.BigEndian.Uint32(lenBuf[:]))
+		if recordLen <= 0 || recordLen > maxRecordSize {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): corrupt deferred file %s - invalid record size %d", c.name, fn, recordLen)
+			corrupt = true
+			break
+		}
+		buf := make([]byte, recordLen)
+		_, err = io.ReadFull(f, buf)
+		if err != nil {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): corrupt deferred file %s - %s", c.name, fn, err)
+			corrupt = true
+			break
+		}
+		msg, deferredTs, err := decodeDeferredMessage(buf)
+		if err != nil {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to decode deferred message - %s", c.name, err)
+			corrupt = true
+			continue
+		}
+		// restore the persisted absolute expiry verbatim; messages whose
+		// expiry passed while nsqd was down are promoted by the normal
+		// queue scan immediately after startup
+		item := &pqueue.Item{Value: msg, Priority: deferredTs}
+		err = c.pushDeferredMessage(item)
+		if err != nil {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to restore deferred message - %s", c.name, err)
+			continue
+		}
+		c.addToDeferredPQ(item)
+		restored++
+	}
+	_ = f.Close()
+
+	if restored > 0 {
+		c.nsqd.logf(LOG_INFO, "CHANNEL(%s): restored %d deferred messages", c.name, restored)
+	}
+
+	if corrupt {
+		// keep the file around for forensics
+		badFn := fn + ".bad"
+		_ = os.Remove(badFn)
+		if err := os.Rename(fn, badFn); err != nil {
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to rename corrupt deferred file %s - %s", c.name, fn, err)
+		}
+		return
+	}
+	if err := os.Remove(fn); err != nil {
+		c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to remove deferred file %s - %s", c.name, fn, err)
+	}
+}
+
+// persistDeferredMessages atomically snapshots the in-memory deferred
+// message queue to disk. It must be called with deferredMutex held.
+func (c *Channel) persistDeferredMessages() error {
+	fn := c.deferredFileName()
+	tmpFn := fn + ".tmp"
+
+	f, err := os.OpenFile(tmpFn, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+
+	for _, item := range c.deferredMessages {
+		msg := item.Value.(*Message)
+		buf := bufferPoolGet()
+		_, err := writeDeferredMessage(buf, msg, item.Priority)
+		if err == nil {
+			var lenBuf [4]byte
+			binary.BigEndian.PutUint32(lenBuf[:], uint32(buf.Len()))
+			_, err = f.Write(lenBuf[:])
+		}
+		if err == nil {
+			_, err = f.Write(buf.Bytes())
+		}
+		bufferPoolPut(buf)
+		if err != nil {
+			_ = f.Close()
+			_ = os.Remove(tmpFn)
+			return err
+		}
+	}
+
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmpFn)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(tmpFn)
+		return err
+	}
+
+	// os.Rename fails on Windows if the destination exists
+	_ = os.Remove(fn)
+	return os.Rename(tmpFn, fn)
 }
 
 func (c *Channel) initPQ() {
@@ -199,6 +372,12 @@ func (c *Channel) exit(deleted bool) error {
 		err := c.Empty()
 		if err != nil {
 			return err
+		}
+		if !c.ephemeral {
+			// remove any persisted deferred state, too
+			if err := os.Remove(c.deferredFileName()); err != nil && !os.IsNotExist(err) {
+				c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to remove deferred file - %s", c.name, err)
+			}
 		}
 		return c.backend.Delete()
 	}
@@ -275,11 +454,12 @@ finish:
 	c.inFlightMutex.Unlock()
 
 	c.deferredMutex.Lock()
-	for _, item := range c.deferredMessages {
-		msg := item.Value.(*Message)
-		err := writeMessageToBackend(msg, c.backend)
+	if len(c.deferredMessages) > 0 && !c.ephemeral {
+		// persist deferred messages with their absolute expiry timestamps
+		// so the original schedule is restored (not recomputed) on restart
+		err := c.persistDeferredMessages()
 		if err != nil {
-			c.nsqd.logf(LOG_ERROR, "failed to write message to backend - %s", err)
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to persist deferred messages - %s", c.name, err)
 		}
 	}
 	c.deferredMutex.Unlock()
