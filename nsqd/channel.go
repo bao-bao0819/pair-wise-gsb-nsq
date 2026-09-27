@@ -65,6 +65,12 @@ type Channel struct {
 	deleteCallback func(*Channel)
 	deleter        sync.Once
 
+	// ephemeralDeleteTimer, when non-nil, is the pending deletion of this
+	// ephemeral channel after its last consumer left. It is guarded by the
+	// embedded mutex and cancelled if a consumer re-subscribes within the
+	// configured grace period.
+	ephemeralDeleteTimer *time.Timer
+
 	// Stats tracking
 	e2eProcessingLatencyStream *quantile.Quantile
 
@@ -174,6 +180,15 @@ func (c *Channel) exit(deleted bool) error {
 	if !atomic.CompareAndSwapInt32(&c.exitFlag, 0, 1) {
 		return errors.New("exiting")
 	}
+
+	// an explicit delete/close takes precedence over a pending ephemeral
+	// idle grace period timer
+	c.Lock()
+	if c.ephemeralDeleteTimer != nil {
+		c.ephemeralDeleteTimer.Stop()
+		c.ephemeralDeleteTimer = nil
+	}
+	c.Unlock()
 
 	if deleted {
 		c.nsqd.logf(LOG_INFO, "CHANNEL(%s): deleting", c.name)
@@ -485,6 +500,12 @@ func (c *Channel) AddClient(clientID int64, client Consumer) error {
 	}
 
 	c.Lock()
+	if c.ephemeralDeleteTimer != nil {
+		// a consumer re-subscribed within the idle grace period,
+		// cancel the pending ephemeral deletion
+		c.ephemeralDeleteTimer.Stop()
+		c.ephemeralDeleteTimer = nil
+	}
 	c.clients[clientID] = client
 	c.Unlock()
 	return nil
@@ -512,8 +533,52 @@ func (c *Channel) RemoveClient(clientID int64) {
 	c.Unlock()
 
 	if numClients == 0 && c.ephemeral {
-		go c.deleter.Do(func() { c.deleteCallback(c) })
+		if gracePeriod := c.nsqd.getOpts().EphemeralChannelGracePeriod; gracePeriod > 0 {
+			c.scheduleEphemeralDeletion(gracePeriod)
+		} else {
+			go c.deleter.Do(func() { c.deleteCallback(c) })
+		}
 	}
+}
+
+// scheduleEphemeralDeletion arranges for this ephemeral channel to be
+// deleted after the idle grace period, unless a consumer re-subscribes
+// first (see AddClient) or the channel is explicitly deleted/closed.
+//
+// The channel remains fully functional in the meantime, so any backlog
+// is still bounded by the configured memory/message limits.
+func (c *Channel) scheduleEphemeralDeletion(gracePeriod time.Duration) {
+	c.Lock()
+	if c.ephemeralDeleteTimer != nil {
+		c.ephemeralDeleteTimer.Stop()
+	}
+	c.ephemeralDeleteTimer = time.AfterFunc(gracePeriod, c.ephemeralDeletionExpired)
+	c.Unlock()
+}
+
+// ephemeralDeletionExpired is invoked when the idle grace period of this
+// ephemeral channel elapses. If a consumer re-subscribed in the meantime
+// the deletion is aborted.
+func (c *Channel) ephemeralDeletionExpired() {
+	proceed := func() {
+		c.Lock()
+		if len(c.clients) > 0 {
+			c.ephemeralDeleteTimer = nil
+			c.Unlock()
+			c.nsqd.logf(LOG_INFO, "CHANNEL(%s): skipping deletion, consumer re-subscribed during grace period", c.name)
+			return
+		}
+		c.ephemeralDeleteTimer = nil
+		c.Unlock()
+
+		c.deleter.Do(func() { c.deleteCallback(c) })
+	}
+
+	if hook := c.nsqd.getOpts().ephemeralDeletionHook; hook != nil {
+		hook(c, proceed)
+		return
+	}
+	proceed()
 }
 
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {

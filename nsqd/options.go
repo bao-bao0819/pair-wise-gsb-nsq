@@ -64,6 +64,9 @@ type Options struct {
 	OutputBufferTimeout    time.Duration `flag:"output-buffer-timeout"`
 	MaxChannelConsumers    int           `flag:"max-channel-consumers"`
 
+	// ephemeral channel options
+	EphemeralChannelGracePeriod time.Duration `flag:"ephemeral-channel-grace-period" cfg:"ephemeral_channel_grace_period"`
+
 	// statsd integration
 	StatsdAddress          string        `flag:"statsd-address"`
 	StatsdPrefix           string        `flag:"statsd-prefix"`
@@ -91,6 +94,12 @@ type Options struct {
 
 	// experimental features
 	Experiments []string `flag:"enable-experiment" cfg:"enable_experiment"`
+
+	// ephemeralDeletionHook, if set, is invoked when the idle grace period
+	// of an ephemeral channel expires, instead of the deletion attempt,
+	// which it must trigger itself by calling proceed. It is used by tests
+	// to synchronize on the deletion.
+	ephemeralDeletionHook func(c *Channel, proceed func())
 }
 
 type Experiment string

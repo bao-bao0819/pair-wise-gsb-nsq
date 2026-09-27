@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -257,4 +258,242 @@ func TestChannelHealth(t *testing.T) {
 	err = resp.Body.Close()
 	test.Nil(t, err)
 	test.Equal(t, "OK", string(body))
+}
+
+func waitForEphemeralChannelDeletion(t *testing.T, topic *Topic, name string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		topic.RLock()
+		_, ok := topic.channelMap[name]
+		topic.RUnlock()
+		if !ok {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for ephemeral channel %s to be deleted", name)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// an ephemeral channel with no consumers is deleted once the configured
+// idle grace period elapses
+func TestEphemeralChannelGracePeriodExpires(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.EphemeralChannelGracePeriod = 10 * time.Millisecond
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_ephemeral_grace_expire" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channelName := "ch#ephemeral"
+	channel := topic.GetChannel(channelName)
+
+	client := newClientV2(0, nil, nsqd)
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+	channel.RemoveClient(client.ID)
+
+	waitForEphemeralChannelDeletion(t, topic, channelName)
+	test.Equal(t, true, channel.Exiting())
+}
+
+// a consumer re-subscribing within the idle grace period cancels the
+// pending deletion of an ephemeral channel
+func TestEphemeralChannelGracePeriodResubscribe(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.EphemeralChannelGracePeriod = 10 * time.Millisecond
+
+	expired := make(chan struct{})
+	resume := make(chan struct{})
+	deleted := make(chan struct{})
+	var once sync.Once
+	opts.ephemeralDeletionHook = func(c *Channel, proceed func()) {
+		once.Do(func() { close(expired) })
+		<-resume
+		proceed()
+		close(deleted)
+	}
+
+	tcpAddr, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_ephemeral_grace_resub" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channelName := "ch#ephemeral"
+	channel := topic.GetChannel(channelName)
+
+	client1 := newClientV2(0, nil, nsqd)
+	err := channel.AddClient(client1.ID, client1)
+	test.Nil(t, err)
+	channel.RemoveClient(client1.ID)
+
+	// wait until the grace period has expired and the deletion is
+	// precisely about to trigger
+	<-expired
+
+	// re-subscribe at the exact moment the deletion triggers
+	conn, _ := mustConnectNSQD(tcpAddr)
+	defer func() { _ = conn.Close() }()
+	client2 := newClientV2(1, conn, nsqd)
+	err = channel.AddClient(client2.ID, client2)
+	test.Nil(t, err)
+	close(resume)
+
+	// the deletion attempt has now completed and must have been aborted
+	<-deleted
+	test.Equal(t, false, channel.Exiting())
+	_, err = topic.GetExistingChannel(channelName)
+	test.Nil(t, err)
+}
+
+// an explicit delete (followed by a same-name re-creation) takes
+// precedence over a pending ephemeral deletion: the stale timer must not
+// delete the new channel instance
+func TestEphemeralChannelStaleTimerDoesNotDeleteNewInstance(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.EphemeralChannelGracePeriod = 10 * time.Millisecond
+
+	expired := make(chan struct{})
+	resume := make(chan struct{})
+	deleted := make(chan struct{})
+	var once sync.Once
+	opts.ephemeralDeletionHook = func(c *Channel, proceed func()) {
+		once.Do(func() { close(expired) })
+		<-resume
+		proceed()
+		close(deleted)
+	}
+
+	tcpAddr, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_ephemeral_stale_timer" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channelName := "ch#ephemeral"
+	channel1 := topic.GetChannel(channelName)
+
+	client1 := newClientV2(0, nil, nsqd)
+	err := channel1.AddClient(client1.ID, client1)
+	test.Nil(t, err)
+	channel1.RemoveClient(client1.ID)
+
+	// wait until the grace period has expired and the deletion of the
+	// first channel instance is precisely about to trigger
+	<-expired
+
+	// an explicit delete wins over the pending timer...
+	err = topic.DeleteExistingChannel(channelName)
+	test.Nil(t, err)
+
+	// ...and a new channel with the same name is created
+	channel2 := topic.GetChannel(channelName)
+	test.Equal(t, true, channel1 != channel2)
+	conn, _ := mustConnectNSQD(tcpAddr)
+	defer func() { _ = conn.Close() }()
+	client2 := newClientV2(1, conn, nsqd)
+	err = channel2.AddClient(client2.ID, client2)
+	test.Nil(t, err)
+
+	// let the stale timer fire
+	close(resume)
+
+	// the stale deletion attempt has now completed and must not have
+	// touched the new instance
+	<-deleted
+	test.Equal(t, false, channel2.Exiting())
+	existing, err := topic.GetExistingChannel(channelName)
+	test.Nil(t, err)
+	test.Equal(t, true, existing == channel2)
+}
+
+// a topic exit takes precedence over a pending ephemeral deletion of one
+// of its channels: the stale timer must be a no-op
+func TestEphemeralChannelStaleTimerAfterTopicDelete(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.EphemeralChannelGracePeriod = 10 * time.Millisecond
+
+	expired := make(chan struct{})
+	resume := make(chan struct{})
+	deleted := make(chan struct{})
+	var once sync.Once
+	opts.ephemeralDeletionHook = func(c *Channel, proceed func()) {
+		once.Do(func() { close(expired) })
+		<-resume
+		proceed()
+		close(deleted)
+	}
+
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_ephemeral_topic_exit" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channelName := "ch#ephemeral"
+	channel := topic.GetChannel(channelName)
+
+	client := newClientV2(0, nil, nsqd)
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+	channel.RemoveClient(client.ID)
+
+	// wait until the grace period has expired and the deletion is
+	// precisely about to trigger
+	<-expired
+
+	// the topic is deleted while the timer is in flight
+	err = nsqd.DeleteExistingTopic(topicName)
+	test.Nil(t, err)
+
+	// let the stale timer fire; it must not error or resurrect anything
+	close(resume)
+	<-deleted
+
+	test.Equal(t, true, channel.Exiting())
+	topic.RLock()
+	numChannels := len(topic.channelMap)
+	topic.RUnlock()
+	test.Equal(t, 0, numChannels)
+}
+
+// while an ephemeral channel is kept alive during the idle grace period
+// its backlog is still bounded by the configured memory limit, it does
+// not silently become a permanent queue
+func TestEphemeralChannelGracePeriodBacklogBounded(t *testing.T) {
+	opts := NewOptions()
+	opts.Logger = test.NewTestLogger(t)
+	opts.MemQueueSize = 1
+	opts.EphemeralChannelGracePeriod = time.Hour
+	_, _, nsqd := mustStartNSQD(opts)
+	defer func() { _ = os.RemoveAll(opts.DataPath) }()
+	defer nsqd.Exit()
+
+	topicName := "test_ephemeral_grace_backlog" + strconv.Itoa(int(time.Now().Unix()))
+	topic := nsqd.GetTopic(topicName)
+	channel := topic.GetChannel("ch#ephemeral")
+
+	client := newClientV2(0, nil, nsqd)
+	err := channel.AddClient(client.ID, client)
+	test.Nil(t, err)
+	channel.RemoveClient(client.ID)
+
+	// the channel is now idle within its grace period; messages in
+	// excess of the memory limit are dropped (ephemeral channels have
+	// no persistent backend)
+	for i := 0; i < 3; i++ {
+		msg := NewMessage(topic.GenerateID(), []byte("test"))
+		err = channel.PutMessage(msg)
+		test.Nil(t, err)
+	}
+	test.Equal(t, int64(1), channel.Depth())
+	test.Equal(t, false, channel.Exiting())
 }
