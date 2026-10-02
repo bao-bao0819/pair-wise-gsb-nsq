@@ -55,6 +55,7 @@ type ChannelStats struct {
 	GlobalMsgCount      uint64        `json:"global_msg_count,omitempty"`
 	RequeueCount        uint64        `json:"requeue_count"`
 	TimeoutCount        uint64        `json:"timeout_count"`
+	QuarantineCount     uint64        `json:"quarantine_count"`
 	ClientCount         int           `json:"client_count"`
 	Clients             []ClientStats `json:"clients"`
 	Paused              bool          `json:"paused"`
@@ -82,6 +83,7 @@ func NewChannelStats(c *Channel, clients []ClientStats, clientCount int) Channel
 		GlobalMsgCount:      atomic.LoadUint64(&c.globalMsgCount),
 		RequeueCount:        atomic.LoadUint64(&c.requeueCount),
 		TimeoutCount:        atomic.LoadUint64(&c.timeoutCount),
+		QuarantineCount:     atomic.LoadUint64(&c.quarantineCount),
 		ClientCount:         clientCount,
 		Clients:             clients,
 		Paused:              c.IsPaused(),

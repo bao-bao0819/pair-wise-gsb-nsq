@@ -14,6 +14,7 @@ import (
 
 	"github.com/nsqio/nsq/internal/lg"
 	"github.com/nsqio/nsq/internal/pqueue"
+	"github.com/nsqio/nsq/internal/protocol"
 	"github.com/nsqio/nsq/internal/quantile"
 )
 
@@ -38,6 +39,7 @@ type Channel struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	requeueCount        uint64
 	messageCount        uint64
+	quarantineCount     uint64
 	zoneLocalMsgCount   uint64
 	regionLocalMsgCount uint64
 	globalMsgCount      uint64
@@ -67,6 +69,11 @@ type Channel struct {
 
 	// Stats tracking
 	e2eProcessingLatencyStream *quantile.Quantile
+
+	// quarantine (dead-letter) configuration; guarded by quarantineMutex
+	quarantineMutex     sync.RWMutex
+	maxDeliveryAttempts int
+	quarantineTarget    string // normalized "topic:channel"
 
 	// TODO: these can be DRYd up
 	deferredMessages map[MessageID]*pqueue.Item
@@ -438,6 +445,20 @@ func (c *Channel) FinishMessage(clientID int64, id MessageID) error {
 //
 //	and requeue a message (aka "deferred requeue")
 func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Duration) error {
+	if c.quarantineEnabled() {
+		msg, err := c.peekInFlightMessage(clientID, id)
+		if err != nil {
+			return err
+		}
+		if c.shouldQuarantine(msg) {
+			// the message exhausted its delivery attempts; migrate it to
+			// the quarantine target. If the target is unavailable the
+			// message is left in-flight (never FIN'd) and an error is
+			// returned so the failure is visible to the client.
+			return c.quarantineMessage(clientID, msg)
+		}
+	}
+
 	// remove from inflight first
 	msg, err := c.popInFlightMessage(clientID, id)
 	if err != nil {
@@ -459,6 +480,195 @@ func (c *Channel) RequeueMessage(clientID int64, id MessageID, timeout time.Dura
 
 	// deferred requeue
 	return c.StartDeferredTimeout(msg, timeout)
+}
+
+// maxQuarantineChainDepth bounds the walk used to detect cycles in
+// quarantine target chains.
+const maxQuarantineChainDepth = 32
+
+// parseQuarantineTarget parses a quarantine target of the form "channel"
+// (same topic) or "topic:channel" and validates the names.
+func parseQuarantineTarget(defaultTopic, target string) (string, string, error) {
+	parts := strings.Split(target, ":")
+	var topicName, channelName string
+	switch len(parts) {
+	case 1:
+		topicName, channelName = defaultTopic, parts[0]
+	case 2:
+		topicName, channelName = parts[0], parts[1]
+	default:
+		return "", "", fmt.Errorf("invalid quarantine target %q, expected channel or topic:channel", target)
+	}
+	if !protocol.IsValidTopicName(topicName) {
+		return "", "", fmt.Errorf("invalid quarantine target topic name %q", topicName)
+	}
+	if !protocol.IsValidChannelName(channelName) {
+		return "", "", fmt.Errorf("invalid quarantine target channel name %q", channelName)
+	}
+	return topicName, channelName, nil
+}
+
+// SetQuarantine configures the maximum number of delivery attempts for this
+// channel and the quarantine target ("channel" or "topic:channel") that
+// messages are moved to once they reach that limit. A target chain that
+// would lead back to this channel is rejected.
+func (c *Channel) SetQuarantine(maxDeliveries int, target string) error {
+	if maxDeliveries < 1 || maxDeliveries > math.MaxInt16 {
+		return fmt.Errorf("max deliveries %d out of range 1-%d", maxDeliveries, math.MaxInt16)
+	}
+	topicName, channelName, err := parseQuarantineTarget(c.topicName, target)
+	if err != nil {
+		return err
+	}
+	if topicName == c.topicName && channelName == c.name {
+		return errors.New("quarantine target cannot be the channel itself")
+	}
+	if c.quarantineChainReaches(topicName, channelName, c.topicName, c.name) {
+		return fmt.Errorf("quarantine target %s:%s would create a cycle back to %s:%s",
+			topicName, channelName, c.topicName, c.name)
+	}
+
+	c.quarantineMutex.Lock()
+	c.maxDeliveryAttempts = maxDeliveries
+	c.quarantineTarget = topicName + ":" + channelName
+	c.quarantineMutex.Unlock()
+	return nil
+}
+
+// ClearQuarantine removes any quarantine configuration from the channel,
+// restoring the default behavior of requeuing messages indefinitely.
+func (c *Channel) ClearQuarantine() {
+	c.quarantineMutex.Lock()
+	c.maxDeliveryAttempts = 0
+	c.quarantineTarget = ""
+	c.quarantineMutex.Unlock()
+}
+
+// QuarantineConfig returns the configured max delivery attempts and the
+// normalized quarantine target ("topic:channel"), or "" if unset.
+func (c *Channel) QuarantineConfig() (int, string) {
+	c.quarantineMutex.RLock()
+	defer c.quarantineMutex.RUnlock()
+	return c.maxDeliveryAttempts, c.quarantineTarget
+}
+
+func (c *Channel) quarantineEnabled() bool {
+	c.quarantineMutex.RLock()
+	defer c.quarantineMutex.RUnlock()
+	return c.maxDeliveryAttempts > 0 && c.quarantineTarget != ""
+}
+
+func (c *Channel) shouldQuarantine(msg *Message) bool {
+	c.quarantineMutex.RLock()
+	defer c.quarantineMutex.RUnlock()
+	return c.maxDeliveryAttempts > 0 && c.quarantineTarget != "" &&
+		int(msg.Attempts) >= c.maxDeliveryAttempts
+}
+
+// quarantineChainReaches follows the quarantine target chain starting at
+// (topicName, channelName) and reports whether it reaches
+// (wantTopic, wantChannel). Only existing channels have configuration, so
+// the walk stops at the first missing or unconfigured channel.
+func (c *Channel) quarantineChainReaches(topicName, channelName, wantTopic, wantChannel string) bool {
+	for i := 0; i < maxQuarantineChainDepth; i++ {
+		if topicName == wantTopic && channelName == wantChannel {
+			return true
+		}
+		topic, err := c.nsqd.GetExistingTopic(topicName)
+		if err != nil {
+			return false
+		}
+		channel, err := topic.GetExistingChannel(channelName)
+		if err != nil {
+			return false
+		}
+		_, target := channel.QuarantineConfig()
+		if target == "" {
+			return false
+		}
+		topicName, channelName, err = parseQuarantineTarget(topicName, target)
+		if err != nil {
+			return false
+		}
+	}
+	return false
+}
+
+// resolveQuarantineTarget returns the configured quarantine target channel,
+// lazily creating the topic/channel if necessary (mirroring PUB semantics).
+func (c *Channel) resolveQuarantineTarget() (*Channel, error) {
+	c.quarantineMutex.RLock()
+	target := c.quarantineTarget
+	c.quarantineMutex.RUnlock()
+	if target == "" {
+		return nil, errors.New("no quarantine target configured")
+	}
+	topicName, channelName, err := parseQuarantineTarget(c.topicName, target)
+	if err != nil {
+		return nil, err
+	}
+	if topicName == c.topicName && channelName == c.name {
+		return nil, errors.New("quarantine target is the channel itself")
+	}
+	channel := c.nsqd.GetTopic(topicName).GetChannel(channelName)
+	if channel.Exiting() {
+		return nil, fmt.Errorf("quarantine target %s is exiting", target)
+	}
+	return channel, nil
+}
+
+// writeToQuarantineTarget writes a copy of msg to the configured quarantine
+// target, preserving the original message ID, body, timestamp and attempt
+// count, and recording this channel as the failure source. The source
+// message is deliberately left untouched; it is the caller's responsibility
+// to remove it from this channel only after this write succeeds.
+func (c *Channel) writeToQuarantineTarget(msg *Message) error {
+	target, err := c.resolveQuarantineTarget()
+	if err != nil {
+		return err
+	}
+	qmsg := &Message{
+		ID:               msg.ID,
+		Body:             msg.Body,
+		Timestamp:        msg.Timestamp,
+		Attempts:         msg.Attempts,
+		QuarantineSource: c.topicName + ":" + c.name,
+	}
+	if err := target.PutMessage(qmsg); err != nil {
+		return fmt.Errorf("quarantine target unavailable - %s", err)
+	}
+	return nil
+}
+
+// quarantineMessage migrates an in-flight message to the configured
+// quarantine target.
+//
+// Delivery semantics are at-least-once: the message is written to the
+// quarantine target BEFORE it is removed from this channel's in-flight
+// state. A crash between the two steps leaves the message in both places
+// (a duplicate on redelivery), but the message is never silently dropped.
+// If the target is unavailable the source message is left in-flight (it is
+// NOT finished) and an error is returned.
+func (c *Channel) quarantineMessage(clientID int64, msg *Message) error {
+	if err := c.writeToQuarantineTarget(msg); err != nil {
+		return err
+	}
+
+	// the message is durably queued in the target; now remove it from the
+	// source channel
+	_, err := c.popInFlightMessage(clientID, msg.ID)
+	if err != nil {
+		// the message was concurrently finished or requeued; it is safe
+		// in the quarantine target regardless
+		c.nsqd.logf(LOG_WARN, "CHANNEL(%s): quarantined message %s already left in-flight - %s",
+			c.name, msg.ID, err)
+	} else {
+		c.removeFromInFlightPQ(msg)
+	}
+	atomic.AddUint64(&c.quarantineCount, 1)
+	c.nsqd.logf(LOG_INFO, "CHANNEL(%s): quarantined message %s after %d attempts",
+		c.name, msg.ID, msg.Attempts)
+	return nil
 }
 
 // AddClient adds a client to the Channel's client list
@@ -570,6 +780,20 @@ func (c *Channel) popInFlightMessage(clientID int64, id MessageID) (*Message, er
 	return msg, nil
 }
 
+// peekInFlightMessage returns an in-flight message without removing it
+func (c *Channel) peekInFlightMessage(clientID int64, id MessageID) (*Message, error) {
+	c.inFlightMutex.Lock()
+	defer c.inFlightMutex.Unlock()
+	msg, ok := c.inFlightMessages[id]
+	if !ok {
+		return nil, errors.New("ID not in flight")
+	}
+	if msg.clientID != clientID {
+		return nil, errors.New("client does not own message")
+	}
+	return msg, nil
+}
+
 func (c *Channel) addToInFlightPQ(msg *Message) {
 	c.inFlightMutex.Lock()
 	c.inFlightPQ.Push(msg)
@@ -673,6 +897,25 @@ func (c *Channel) processInFlightQueue(t int64) bool {
 			goto exit
 		}
 		dirty = true
+
+		if c.shouldQuarantine(msg) {
+			err := c.quarantineMessage(msg.clientID, msg)
+			if err == nil {
+				atomic.AddUint64(&c.timeoutCount, 1)
+				c.RLock()
+				client, ok := c.clients[msg.clientID]
+				c.RUnlock()
+				if ok {
+					client.TimedOutMessage()
+				}
+				continue
+			}
+			// the quarantine target is unavailable; fall through to the
+			// normal requeue path so the message is preserved and the
+			// migration is retried on a subsequent failure
+			c.nsqd.logf(LOG_ERROR, "CHANNEL(%s): failed to quarantine timed-out message %s - %s",
+				c.name, msg.ID, err)
+		}
 
 		_, err := c.popInFlightMessage(msg.clientID, msg.ID)
 		if err != nil {

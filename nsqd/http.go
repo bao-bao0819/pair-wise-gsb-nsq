@@ -73,6 +73,9 @@ func newHTTPServer(nsqd *NSQD, tlsEnabled bool, tlsRequired bool) *httpServer {
 	router.Handle("POST", "/channel/empty", http_api.Decorate(s.doEmptyChannel, log, http_api.V1))
 	router.Handle("POST", "/channel/pause", http_api.Decorate(s.doPauseChannel, log, http_api.V1))
 	router.Handle("POST", "/channel/unpause", http_api.Decorate(s.doPauseChannel, log, http_api.V1))
+	router.Handle("GET", "/channel/quarantine", http_api.Decorate(s.doQuarantineChannel, log, http_api.V1))
+	router.Handle("POST", "/channel/quarantine", http_api.Decorate(s.doQuarantineChannel, log, http_api.V1))
+	router.Handle("DELETE", "/channel/quarantine", http_api.Decorate(s.doQuarantineChannel, log, http_api.V1))
 	router.Handle("GET", "/config/:opt", http_api.Decorate(s.doConfig, log, http_api.V1))
 	router.Handle("PUT", "/config/:opt", http_api.Decorate(s.doConfig, log, http_api.V1))
 
@@ -496,6 +499,54 @@ func (s *httpServer) doPauseChannel(w http.ResponseWriter, req *http.Request, ps
 
 	// pro-actively persist metadata so in case of process failure
 	// nsqd won't suddenly (un)pause a channel
+	s.nsqd.Lock()
+	err = s.nsqd.PersistMetadata()
+	s.nsqd.Unlock()
+	if err != nil {
+		s.nsqd.logf(LOG_ERROR, "failed to persist metadata - %s", err)
+		return nil, http_api.Err{Code: 500, Text: "INTERNAL_ERROR"}
+	}
+	return nil, nil
+}
+
+type quarantineConfigV1 struct {
+	MaxDeliveries int    `json:"max_deliveries"`
+	Target        string `json:"target"`
+}
+
+func (s *httpServer) doQuarantineChannel(w http.ResponseWriter, req *http.Request, ps httprouter.Params) (interface{}, error) {
+	reqParams, topic, channelName, err := s.getExistingTopicFromQuery(req)
+	if err != nil {
+		return nil, err
+	}
+
+	channel, err := topic.GetExistingChannel(channelName)
+	if err != nil {
+		return nil, http_api.Err{Code: 404, Text: "CHANNEL_NOT_FOUND"}
+	}
+
+	switch req.Method {
+	case "GET":
+		maxDeliveries, target := channel.QuarantineConfig()
+		return &quarantineConfigV1{MaxDeliveries: maxDeliveries, Target: target}, nil
+	case "POST":
+		var cfg quarantineConfigV1
+		err = json.Unmarshal(reqParams.Body, &cfg)
+		if err != nil {
+			return nil, http_api.Err{Code: 400, Text: "INVALID_QUARANTINE_CONFIG"}
+		}
+		err = channel.SetQuarantine(cfg.MaxDeliveries, cfg.Target)
+		if err != nil {
+			return nil, http_api.Err{Code: 400, Text: err.Error()}
+		}
+	case "DELETE":
+		channel.ClearQuarantine()
+	default:
+		return nil, http_api.Err{Code: 405, Text: "METHOD_NOT_ALLOWED"}
+	}
+
+	// pro-actively persist metadata so in case of process failure
+	// nsqd won't suddenly change quarantine behavior
 	s.nsqd.Lock()
 	err = s.nsqd.PersistMetadata()
 	s.nsqd.Unlock()

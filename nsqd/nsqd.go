@@ -307,8 +307,10 @@ type TopicMetadata struct {
 
 // ChannelMetadata is the collection of persistent information about a channel.
 type ChannelMetadata struct {
-	Name   string `json:"name"`
-	Paused bool   `json:"paused"`
+	Name                string `json:"name"`
+	Paused              bool   `json:"paused"`
+	MaxDeliveryAttempts int    `json:"max_delivery_attempts,omitempty"`
+	QuarantineTarget    string `json:"quarantine_target,omitempty"`
 }
 
 func newMetadataFile(opts *Options) string {
@@ -384,6 +386,11 @@ func (n *NSQD) LoadMetadata() error {
 					n.logf(LOG_ERROR, "CHANNEL(%s): failed to pause while loading metadata - %s", c.Name, err)
 				}
 			}
+			if c.QuarantineTarget != "" {
+				if err := channel.SetQuarantine(c.MaxDeliveryAttempts, c.QuarantineTarget); err != nil {
+					n.logf(LOG_ERROR, "CHANNEL(%s): failed to restore quarantine config - %s", c.Name, err)
+				}
+			}
 		}
 		topic.Start()
 	}
@@ -410,9 +417,12 @@ func (n *NSQD) GetMetadata(ephemeral bool) *Metadata {
 			if channel.ephemeral {
 				continue
 			}
+			maxDeliveries, quarantineTarget := channel.QuarantineConfig()
 			topicData.Channels = append(topicData.Channels, ChannelMetadata{
-				Name:   channel.name,
-				Paused: channel.IsPaused(),
+				Name:                channel.name,
+				Paused:              channel.IsPaused(),
+				MaxDeliveryAttempts: maxDeliveries,
+				QuarantineTarget:    quarantineTarget,
 			})
 		}
 		topic.Unlock()
